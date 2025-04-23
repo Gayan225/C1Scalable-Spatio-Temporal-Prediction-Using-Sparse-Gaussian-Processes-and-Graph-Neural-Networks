@@ -1,0 +1,90 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import pdist, squareform
+from scipy.optimize import minimize, curve_fit
+from scipy.linalg import cho_factor, cho_solve
+
+# load data
+df=pd.read_excel('pm10.xlsx')
+df['time']=pd.to_datetime(df['time'])
+df['node']=df['coords.x1'].astype(str)+'_'+df['coords.x2'].astype(str)
+df=df.sample(frac=1,random_state=42).reset_index(drop=True)
+i=int(len(df)*0.8)
+df_train,df_test=df.iloc[:i].copy(),df.iloc[i:].copy()
+print('Train:',len(df_train),'Test:',len(df_test))
+
+# spatial fit
+tp=df_train.pivot('node','time','PM10').sort_index(axis=1)
+coords=df_train.groupby('node')[['coords.x1','coords.x2']].first().loc[tp.index].values
+D=tp.values
+mask=~np.all(np.isnan(D) | (D==D[:,0][:,None]),axis=1)
+coords, D=coords[mask],D[mask]
+dists, pairs=[],[]
+for a in range(len(coords)):
+    for b in range(a+1,len(coords)):
+        d=np.linalg.norm(coords[b]-coords[a])/1000
+        r=np.corrcoef(*[x[mask] for x in (D[a],D[b])])[0,1] if not np.isnan(D[a]).all() else np.nan
+        dists.append(d); pairs.append(r)
+h=np.array(dists);r=np.array(pairs)
+valid=~np.isnan(r)
+h,r,hist=np.compress(valid,h,0),np.compress(valid,r,0),None
+bins=15; edges=np.linspace(h.min(),h.max(),bins+1)
+count=[((h>=edges[j])&(h<edges[j+1])).sum() for j in range(bins)]
+sumr=[r[(h>=edges[j])&(h<edges[j+1])].sum() for j in range(bins)]
+centers=0.5*(edges[:-1]+edges[1:])
+rho=[sumr[j]/count[j] for j in range(bins) if count[j]]
+hc=[centers[j] for j in range(bins) if count[j]]
+def corr_sp(h,v,c): return (1-v)*np.exp(-c*h)
+def obj_s(p): return np.sum([(rho[j]-corr_sp(hc[j],*p))**2*count[j] for j in range(len(rho))])
+v_est,c_est=minimize(obj_s,(0.05,0.001),bounds=[(0,1),(0,None)]).x
+print(f"v={v_est:.4f}, c={c_est:.4f}")
+
+# temporal fit
+tp2=tp.reindex(columns=pd.date_range(tp.columns.min(),tp.columns.max(),freq='D'))
+D2=tp2.values
+def emp(lag):
+    vals=[]
+    for row in D2:
+        x,y=row[:-lag],row[lag:]
+        m=~np.isnan(x)&~np.isnan(y)
+        if m.sum()>1: vals.append(np.corrcoef(x[m],y[m])[0,1])
+    return np.mean(vals) if vals else np.nan,len(vals)
+
+lags,rt,wt=[],[],[]
+for lag in range(1,D2.shape[1]):
+    corr,c=count=emp(lag)
+    if not np.isnan(corr): lags.append(lag);rt.append(corr);wt.append(c)
+def corr_t(u,a,alpha): return (1+a*u**(2*alpha))**-1
+def obj_t(p): return np.sum([(rt[j]-corr_t(lags[j],*p))**2*wt[j] for j in range(len(lags))])
+a_est,alpha_est=minimize(obj_t,(1e-3,0.5),bounds=[(0,None),(1e-6,1)]).x
+print(f"a={a_est:.6f}, alpha={alpha_est:.6f}")
+
+# beta fit
+coords_st=coords; times=[t.timestamp() for t in sorted(tp.index)]
+M=D-np.nanmean(D)
+sd,sq=pdist(coords_st),pdist(np.abs(np.subtract.outer(times,times))/3600)
+# flatten and bin
+# use nonsep model f((h,u);beta)
+def nonsep(x,beta):h,u=x;d=1+a_est*u**(2*alpha_est);np.exp(-c_est*(h)/(d**(beta/2)))*(1-v_est)/d
+
+# predict test
+train_coords=np.array([df_train['coords.x1']/1000,df_train['coords.x2']/1000]).T
+t0=df_train['time'].min();t_days=lambda t:(t-t0).total_seconds()/86400
+coords_test=np.array([df_test['coords.x1']/1000,df_test['coords.x2']/1000]]).T
+times_test=df_test['time'].map(t_days).values
+z= df_train['PM10'].values
+
+def knn_pred(s,t):
+    covs=[(1-v_est)/ (1+a_est*abs(t-ti)**(2*alpha_est))*np.exp(-c_est*np.linalg.norm(s-si)/(1+a_est*abs(t-ti)**(2*alpha_est))**(beta_est/2))
+          for si,ti in zip(train_coords,times_train)]
+    idx=np.argsort(covs)[-25:]
+    C=np.array([[nonsep((np.linalg.norm(train_coords[i]-train_coords[j]),abs(zt-zt2)),beta_est)
+                 for j in idx] for i in idx])
+    c0=np.array([nonsep((np.linalg.norm(s-train_coords[i]),abs(t-times_train[i])),beta_est) for i in idx])
+    w=cho_solve(cho_factor(C),c0)
+    return np.dot(w,z[idx])
+preds=np.array([knn_pred(s,t) for s,t in zip(coords_test,times_test)])
+rmse=np.sqrt(np.nanmean((preds-df_test['PM10'])**2)); mae=np.nanmean(abs(preds-df_test['PM10']))
+print(f"RMSE={rmse:.3f}, MAE={mae:.3f}")
+plt.scatter(df_test['PM10'],preds,alpha=0.5);plt.xlabel('obs');plt.ylabel('pred');plt.show()
