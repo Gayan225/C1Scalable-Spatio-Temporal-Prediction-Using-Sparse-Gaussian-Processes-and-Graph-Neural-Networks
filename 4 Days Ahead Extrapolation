@@ -1,0 +1,405 @@
+#kriging plus GNN - Extrapolation (4 days ahead)
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.nn import GCNConv
+from scipy.spatial.distance import pdist, squareform
+from scipy.linalg import cho_factor, cho_solve
+import matplotlib.pyplot as plt
+
+#Fixed kriging parameters from previous estimation
+v_fixed = 0.0977       # nugget
+c_fixed = 0.0013       # spatial scale (per km)
+a_fixed = 0.493014     # temporal scale parameter
+alpha_fixed = 0.874308 # temporal smoothness parameter
+beta_fixed = 1.0       # space-time interaction parameter
+m_total=9
+# Here our dynamic signal is the PM10 time series (input_dim = 1).
+input_dim = 1
+T_in = 100    # history length
+horizon = 4   # forecast horizon
+num_layers=2
+temporal_kernel=3
+dropout=0.3
+epochs = 150
+
+#KRIGING GENERALLY NON-SEPARABLE COVARIANCE FUNCTIONS
+def cov_nonsep(s_i, t_i, s_j, t_j, v, c, a, alpha, beta):
+    """
+    s_i, s_j: spatial coordinates in km
+    t_i, t_j: time in days
+    """
+    h = np.linalg.norm(s_i - s_j)
+    u = abs(t_i - t_j)
+    denom = 1 + a * (u ** (2 * alpha))
+    exp_part = np.exp(- c * h / (denom ** (beta / 2)))
+    nugget = 1.0 if np.isclose(h, 0, atol=1e-12) else 0.0
+    return (1 - v) / denom * (exp_part + (v / (1 - v)) * nugget)
+
+def get_neighbors(new_s, new_t, coords, times, m_total, v, c, a, alpha, beta):
+    """
+    Return m_total neighbor indices where m_total = n^2, taking the n nearest spatial 
+    neighbors and n nearest temporal neighbors and then combining them. If the union 
+    of these candidate sets is not exactly m_total, the candidates are ranked by 
+    covariance and extra ones are added (or extras are dropped).
+    """
+    n = int(np.sqrt(m_total))  # n = sqrt(m_total)
+    
+    # Compute spatial distances and temporal differences
+    dist = np.linalg.norm(coords - new_s, axis=1)
+    dt = np.abs(times - new_t)
+    
+    # Exclude the "self" location (assume self if both distances are nearly 0)
+    not_self = ~((dist < 1e-12) & (dt < 1e-12))
+    
+    # Get spatial candidates: indices sorted by distance (excluding self)
+    all_idx = np.arange(len(coords))[not_self]
+    spatial_order = np.argsort(dist[not_self])
+    spatial_neighbors = all_idx[spatial_order][:n]
+    
+    # Get temporal candidates: indices sorted by time difference (excluding self)
+    temporal_order = np.argsort(dt[not_self])
+    temporal_neighbors = all_idx[temporal_order][:n]
+    
+    # Combine the two candidate sets (union)
+    candidate_indices = np.union1d(spatial_neighbors, temporal_neighbors)
+    
+    # Compute covariance values for all points (excluding self)
+    cov_vals = np.array([
+        cov_nonsep(new_s, new_t, coords[i], times[i], v, c, a, alpha, beta)
+        for i in range(len(coords))
+    ])
+    cov_vals[~not_self] = -np.inf  # force self to the bottom
+    
+    # If we don't have enough candidates, fill in using overall covariance ranking
+    if candidate_indices.size < m_total:
+        overall_order = np.argsort(cov_vals)[::-1]
+        extra = [idx for idx in overall_order if idx not in candidate_indices]
+        extra_needed = m_total - candidate_indices.size
+        candidate_indices = np.concatenate([candidate_indices, np.array(extra[:extra_needed])])
+    # If we have too many candidates, choose the m_total ones with highest covariance
+    elif candidate_indices.size > m_total:
+        candidate_cov = cov_vals[candidate_indices]
+        sorted_idx = np.argsort(candidate_cov)[::-1]
+        candidate_indices = candidate_indices[sorted_idx][:m_total]
+    
+    return candidate_indices
+
+def st_kriging(new_s, new_t, coords, times, zvals, v, c, a, alpha, beta, m_total):
+    """
+    Perform nearest-neighbor spatio-temporal kriging forecast.
+    new_s, new_t: location (km) and time (days) for forecast.
+    coords, times, zvals: training node coordinates, time stamps, and observed values.
+    """
+    idx_nn = get_neighbors(new_s, new_t, coords, times, m_total, v, c, a, alpha, beta)
+    n = len(idx_nn)
+    C = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            C[i, j] = cov_nonsep(coords[idx_nn[i]], times[idx_nn[i]],
+                                 coords[idx_nn[j]], times[idx_nn[j]],
+                                 v, c, a, alpha, beta)
+    c0 = np.zeros(n)
+    for i in range(n):
+        c0[i] = cov_nonsep(new_s, new_t, coords[idx_nn[i]], times[idx_nn[i]],
+                           v, c, a, alpha, beta)
+    L, lower = cho_factor(C, lower=True)
+    weights = cho_solve((L, lower), c0)
+    prediction = np.dot(weights, zvals[idx_nn])
+    return prediction
+
+def compute_dynamic_adjacency(static_node_features, top_k=1):
+    coords = static_node_features[:, :2] / 1000.0
+    diff = coords.unsqueeze(1) - coords.unsqueeze(0)  # (N, N, 2)
+    dists = torch.norm(diff, dim=-1)  # (N, N)
+    # Compute spatial covariance using fitted spatial model: (1-v)*exp(-c * h)
+    cov_matrix = (1 - v_fixed) * torch.exp(- c_fixed * dists)
+    # Zero out self-covariance
+    diag_mask = torch.eye(cov_matrix.size(0), device=cov_matrix.device).bool()
+    cov_matrix[diag_mask] = 0.0
+    # For each node, keep only the top_k highest covariance edges
+    topk_mask = torch.zeros_like(cov_matrix)
+    num_nodes = cov_matrix.size(0)
+    for i in range(num_nodes):
+        if top_k > 0:
+            vals, idx = torch.topk(cov_matrix[i], top_k)
+            topk_mask[i, idx] = 1.0
+    A = cov_matrix * topk_mask
+    # Symmetrize the matrix
+    A = torch.max(A, A.t())
+    return A
+
+class GraphWaveNetMultiStepWithKriging(nn.Module):
+    def __init__(self, input_dim, hidden_dim, horizon, num_nodes,
+                 num_layers, temporal_kernel, dropout):
+        super().__init__()
+        self.horizon = horizon
+        self.num_nodes = num_nodes
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        # Input mapping
+        self.input_conv = nn.Conv1d(input_dim, hidden_dim, kernel_size=1) if input_dim != hidden_dim else None
+
+        # Temporal convolution layers with BatchNorm and residual connections
+        self.temporal_convs = nn.ModuleList([
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=temporal_kernel, padding=temporal_kernel // 2)
+            for _ in range(num_layers)
+        ])
+        self.temporal_bns = nn.ModuleList([nn.BatchNorm1d(hidden_dim) for _ in range(num_layers)])
+
+        # Spatial GCN layers with LayerNorm and residual connections
+        self.spatial_convs = nn.ModuleList([GCNConv(hidden_dim, hidden_dim) for _ in range(num_layers)])
+        self.spatial_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+
+        # Final output layer (per-node forecast for the horizon)
+        self.fc_out = nn.Linear(hidden_dim, horizon)
+
+    def forward(self, x, static_node_features, edge_index=None, edge_weight=None, krig_skip=None):
+        batch_size, num_nodes, input_dim, seq_len = x.shape
+
+        # Compute dynamic adjacency based on fitted spatial covariance
+        if edge_index is None:
+            A = compute_dynamic_adjacency(static_node_features, top_k=1)
+            mask = A > 1e-4
+            edge_index = mask.nonzero(as_tuple=False).t().contiguous()  # shape (2, num_edges)
+            edge_weight = A[mask]
+
+        # Reshape for temporal convolutions: (batch_size*num_nodes, input_dim, seq_len)
+        x = x.reshape(batch_size * num_nodes, input_dim, seq_len)
+        if self.input_conv is not None:
+            x = self.input_conv(x)
+
+        # Apply temporal convolutions with residual connections.
+        for conv, bn in zip(self.temporal_convs, self.temporal_bns):
+            residual = x
+            out = conv(x)
+            out = bn(out)
+            x = F.relu(out + residual)
+            x = F.dropout(x, self.dropout, training=self.training)
+        # Aggregate temporally (average pooling)
+        x = torch.mean(x, dim=2)  # (batch_size*num_nodes, hidden_dim)
+        x = x.reshape(batch_size, num_nodes, -1)
+        x = x.reshape(batch_size * num_nodes, -1)
+
+        # Spatial (GCN) convolutions with residual connections.
+        for conv, norm in zip(self.spatial_convs, self.spatial_norms):
+            residual = x
+            out = conv(x, edge_index, edge_weight)
+            out = norm(out)
+            x = F.relu(out + residual)
+            x = F.dropout(x, self.dropout, training=self.training)
+        x = x.reshape(batch_size, num_nodes, -1)
+
+        # Final forecast from GNN.
+        out_gnn = self.fc_out(x)  # (batch_size, num_nodes, horizon)
+        # Add the kriging skip connection if provided.
+        if krig_skip is not None:
+            out_final = out_gnn + krig_skip
+        else:
+            out_final = out_gnn
+        return out_final
+
+df = pd.read_excel('pm10.xlsx')
+df['time'] = pd.to_datetime(df['time'])
+df['node'] = df['coords.x1'].astype(str) + "_" + df['coords.x2'].astype(str)
+
+df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+split_idx = int(len(df) * 0.8)
+df_train = df.iloc[:split_idx].copy()
+df_test  = df.iloc[split_idx:].copy()
+
+print("Training set size:", len(df_train))
+print("Test set size:", len(df_test))
+
+# Pivot training data: each row is a node’s PM10 time series.
+train_pivot = df_train.pivot(index='node', columns='time', values='PM10')
+train_pivot = train_pivot.sort_index(axis=1)
+observed_nodes = train_pivot.shape[0]
+
+# Extract static node features (spatial coordinates and extra covariates).
+static_features = df_train.groupby('node')[['coords.x1', 'coords.x2', 'station_altitude', 'annual_mean_PM10']].first()
+static_features_np = static_features.values.astype(np.float32)
+static_features_tensor = torch.tensor(static_features_np, dtype=torch.float32)
+
+#Form training samples using a sliding window ---
+
+train_series = train_pivot.fillna(np.nanmean(train_pivot.values)).values.astype(np.float32)
+#train_series = train_pivot.values.astype(np.float32)  # shape: (num_nodes, L)
+L = train_series.shape[1]
+num_samples = L - T_in - horizon + 1
+
+x_train_list, y_train_list = [], []
+for i in range(num_samples):
+    x_train_list.append(train_series[:, i:i+T_in][:, np.newaxis, :])  # shape: (num_nodes, 1, T_in)
+    y_train_list.append(train_series[:, i+T_in:i+T_in+horizon])         # shape: (num_nodes, horizon)
+x_train_np = np.stack(x_train_list, axis=0)  # (num_samples, num_nodes, 1, T_in)
+y_train_np = np.stack(y_train_list, axis=0)    # (num_samples, num_nodes, horizon)
+
+x_train = torch.tensor(x_train_np, dtype=torch.float32)
+y_train = torch.tensor(y_train_np, dtype=torch.float32)
+
+# For evaluation, prepare test samples
+test_pivot = df_test.pivot(index='node', columns='time', values='PM10')
+test_pivot = test_pivot.reindex(train_pivot.index)  # align with training nodes
+test_series = test_pivot.fillna(np.nanmean(train_series)).values.astype(np.float32)
+L_test = test_series.shape[1]
+num_samples_test = L_test - T_in - horizon + 1
+
+x_test_list, y_test_list = [], []
+for i in range(num_samples_test):
+    x_test_list.append(test_series[:, i:i+T_in][:, np.newaxis, :])
+    y_test_list.append(test_series[:, i+T_in:i+T_in+horizon])
+x_test_np = np.stack(x_test_list, axis=0)
+y_test_np = np.stack(y_test_list, axis=0)
+
+x_test = torch.tensor(x_test_np, dtype=torch.float32)
+y_test = torch.tensor(y_test_np, dtype=torch.float32)
+
+df_train['x_km'] = df_train['coords.x1'] / 1000.0
+df_train['y_km'] = df_train['coords.x2'] / 1000.0
+t0 = df_train['time'].min()
+df_train['t_days'] = (df_train['time'] - t0).dt.total_seconds() / 86400.0
+
+# For each node, get training spatial coordinates and initial time.
+coords_train = df_train.groupby('node')[['x_km', 'y_km']].first().values.astype(np.float32)
+times_train = df_train.groupby('node')['t_days'].first().values.astype(np.float32)
+#times_train = df_train.groupby('node')['t_days'].first().values.astype(np.float32)
+
+# Use the last observed PM10 value (per node) from the training series.
+z_train = train_series[:, -1]  # shape: (num_nodes,)
+
+# Extract time stamps from the training pivot.
+train_times = np.array([(col - t0).total_seconds() / 86400.0 for col in train_pivot.columns]).astype(np.float32)
+forecast_times = np.array([train_times[i+T_in:i+T_in+horizon] for i in range(num_samples)])  # (num_samples, horizon)
+
+# Precompute kriging predictions for training samples.
+
+krig_skip_train = np.zeros((num_samples, observed_nodes, horizon), dtype=np.float32)
+print("Computing kriging skip for training samples...")
+for i in range(num_samples):
+    for n in range(observed_nodes):
+        new_s = static_features_np[n, :2] / 1000.0  # convert to km
+        for j in range(horizon):
+            new_t = forecast_times[i, j]
+            #krig_skip_train[i, n, j] = st_kriging(new_s, new_t, coords_train, times_train, z_train, v_fixed, c_fixed, a_fixed, alpha_fixed, beta_fixed, m_total=25)
+            krig_skip_train[i, n, j] = st_kriging(new_s, new_t, coords_train, times_train,
+                                        z_train, v_fixed, c_fixed, a_fixed, alpha_fixed, beta_fixed,
+                                        m_total)
+
+
+
+# For test samples.
+test_times = np.array([(col - t0).total_seconds() / 86400.0 for col in test_pivot.columns]).astype(np.float32)
+forecast_times_test = np.array([test_times[i+T_in:i+T_in+horizon] for i in range(num_samples_test)])
+krig_skip_test = np.zeros((num_samples_test, observed_nodes, horizon), dtype=np.float32)
+print("Computing kriging skip for test samples...")
+for i in range(num_samples_test):
+    for n in range(observed_nodes):
+        new_s = static_features_np[n, :2] / 1000.0
+        for j in range(horizon):
+            new_t = forecast_times_test[i, j]
+            krig_skip_test[i, n, j] = st_kriging(new_s, new_t, coords_train, times_train,
+                                       z_train, v_fixed, c_fixed, a_fixed, alpha_fixed, beta_fixed,
+                                       m_total)
+
+krig_skip_train = torch.tensor(krig_skip_train, dtype=torch.float32)
+krig_skip_test = torch.tensor(krig_skip_test, dtype=torch.float32)
+
+num_total_samples = x_train.shape[0]
+num_train = int(0.9 * num_total_samples)
+x_val = x_train[num_train:]
+y_val = y_train[num_train:]
+krig_skip_val = krig_skip_train[num_train:]
+
+x_train = x_train[:num_train]
+y_train = y_train[:num_train]
+krig_skip_train = krig_skip_train[:num_train]
+
+num_nodes = observed_nodes  # training on observed nodes
+model = GraphWaveNetMultiStepWithKriging(input_dim=input_dim, hidden_dim=64, horizon=horizon,
+                                          num_nodes=num_nodes, num_layers=4, temporal_kernel=3, dropout=0.3)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.SmoothL1Loss()
+
+
+train_losses = []
+val_losses = []
+
+print("Training the hybrid GNN+Kriging model...")
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+    preds = model(x_train, static_features_tensor, krig_skip=krig_skip_train)
+    loss_train = criterion(preds, y_train)
+    loss_train.backward()
+    optimizer.step()
+    train_losses.append(loss_train.item())
+
+    model.eval()
+    with torch.no_grad():
+        preds_val = model(x_val, static_features_tensor, krig_skip=krig_skip_val)
+        loss_val = criterion(preds_val, y_val)
+        val_losses.append(loss_val.item())
+
+    if (epoch + 1) % 5 == 0:
+        print(f"Epoch {epoch+1}/{epochs}, Training Loss: {loss_train.item():.4f}, Validation Loss: {loss_val.item():.4f}")
+
+model.eval()
+with torch.no_grad():
+    preds_test = model(x_test, static_features_tensor, krig_skip=krig_skip_test)
+    hybrid_loss = criterion(preds_test, y_test).item()
+print("\nHybrid Model Evaluation Loss on Test Set:", hybrid_loss)
+
+def compute_metrics(preds, targets, eps=1e-8):
+    
+    # Mean Squared Error (MSE) and Root MSE.
+    mse = torch.mean((preds - targets) ** 2).item()
+    rmse = np.sqrt(mse)
+    
+    # Mean Absolute Error (MAE) and Median Absolute Error (MedAE).
+    mae = torch.mean(torch.abs(preds - targets)).item()
+    medae = torch.median(torch.abs(preds - targets)).item()
+    
+    # MASE: compute a scale factor based on the naive forecast (previous target value).
+    if targets.numel() > 1:
+        naive_errors = torch.abs(targets[1:] - targets[:-1])
+        scale = torch.mean(naive_errors)
+    else:
+        scale = torch.tensor(eps)
+    mase = mae / (scale.item() + eps)
+    
+    # sMAPE: symmetric Mean Absolute Percentage Error, reported as a percentage.
+    smape = torch.mean(2 * torch.abs(preds - targets) / 
+                         (torch.abs(preds) + torch.abs(targets) + eps)).item() * 100
+    
+    # R^2: Coefficient of determination.
+    ss_res = torch.sum((targets - preds) ** 2)
+    ss_tot = torch.sum((targets - torch.mean(targets)) ** 2) + eps
+    r2 = (1 - ss_res / ss_tot).item()
+    
+    return mse, rmse, mae, medae, mase, smape, r2
+
+mse_h, rmse_h, mae_h, medae_h, mase_h, smape_h, r2_h = compute_metrics(preds_test, y_test)
+print("\nHybrid Model Performance Metrics:")
+print(f"MSE: {mse_h:.4f}, RMSE: {rmse_h:.4f}, MAE: {mae_h:.4f}, medAE: {medae_h:.4f}, MASE: {mase_h:.4f}, sMAPE: {smape_h:.4f}%, R2: {r2_h:.4f}")
+
+# Evaluate pure kriging on test samples (using precomputed krig_skip_test as predictions).
+kriging_preds = krig_skip_test  # shape: (num_samples_test, num_nodes, horizon)
+kriging_loss = torch.mean((kriging_preds - y_test) ** 2).item()
+mse_k, rmse_k, mae_k, medae_k, mase_k, smape_k, r2_k = compute_metrics(kriging_preds, y_test)
+print("\nPure Kriging Performance Metrics:")
+print(f"MSE: {mse_k:.4f}, RMSE: {rmse_k:.4f}, MAE: {mae_k:.4f}, medAE: {medae_k:.4f}, MASE: {mase_k:.4f}, sMAPE: {smape_k:.4f}%, R2: {r2_k:.4f}")
+
+plt.figure(figsize=(8, 5))
+plt.plot(train_losses, label="Training Loss")
+plt.plot(val_losses, label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Convergence Curve: Training vs Validation Loss")
+plt.legend()
+plt.show()
