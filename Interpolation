@@ -1,0 +1,119 @@
+#Kriging plus GNN - Interpolation 
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch_geometric.nn import GCNConv
+from scipy.linalg import cho_factor, cho_solve
+import matplotlib.pyplot as plt
+
+# kriging and GNN parameters
+v_fixed=0.0977; c_fixed=0.0013; a_fixed=0.493014
+alpha_fixed=0.874308; beta_fixed=1.0; m_total=36
+input_dim=1; T_in=None; horizon=None
+dropout=0.3; epochs=150
+
+def cov_nonsep(s_i, t_i, s_j, t_j, v, c, a, alpha, beta):
+    h=np.linalg.norm(s_i-s_j); u=abs(t_i-t_j)
+    d=1+a*(u**(2*alpha))
+    e=np.exp(-c*h/(d**(beta/2)))
+    n=1.0 if np.isclose(h,0) else 0.0
+    return (1-v)/d*(e+(v/(1-v))*n)
+
+def get_neighbors(s, t, coords, times, m, v, c, a, alpha, beta):
+    n=int(np.sqrt(m))
+    dist=np.linalg.norm(coords-s,axis=1)
+    dt=np.abs(times-t)
+    mask=~((dist<1e-12)&(dt<1e-12))
+    idx=np.arange(len(coords))[mask]
+    cand=np.union1d(idx[np.argsort(dist[mask])][:n], idx[np.argsort(dt[mask])][:n])
+    covs=np.array([cov_nonsep(s,t,coords[i],times[i],v,c,a,alpha,beta) for i in range(len(coords))])
+    covs[~mask]=-np.inf
+    if cand.size<m:
+        extra=[i for i in np.argsort(covs)[::-1] if i not in cand]
+        cand=np.concatenate([cand, extra[:m-cand.size]])
+    elif cand.size>m:
+        cand=cand[np.argsort(covs[cand])[::-1][:m]]
+    return cand
+
+def st_kriging(s, t, coords, times, z, v, c, a, alpha, beta, m):
+    idx=get_neighbors(s,t,coords,times,m,v,c,a,alpha,beta)
+    n=len(idx); C=np.zeros((n,n)); c0=np.zeros(n)
+    for i in range(n):
+        for j in range(n):
+            C[i,j]=cov_nonsep(coords[idx[i]],times[idx[i]],coords[idx[j]],times[idx[j]],v,c,a,alpha,beta)
+        c0[i]=cov_nonsep(s,t,coords[idx[i]],times[idx[i]],v,c,a,alpha,beta)
+    L,low=cho_factor(C,lower=True)
+    w=cho_solve((L,low),c0)
+    return w.dot(z[idx])
+
+class GWN(nn.Module):
+    def __init__(self, in_dim, hd, hz, nodes, ly, kernel, do):
+        super().__init__()
+        self.ic=nn.Conv1d(in_dim,hd,1) if in_dim!=hd else None
+        self.t_convs=nn.ModuleList([nn.Conv1d(hd,hd,kernel,padding=kernel//2) for _ in range(ly)])
+        self.bns=nn.ModuleList([nn.BatchNorm1d(hd) for _ in range(ly)])
+        self.s_convs=nn.ModuleList([GCNConv(hd,hd) for _ in range(ly)])
+        self.norms=nn.ModuleList([nn.LayerNorm(hd) for _ in range(ly)])
+        self.fc=nn.Linear(hd,hz); self.do=do
+    def forward(self, x, sf, ei=None, ew=None, ks=None):
+        b,n,_,L=x.shape
+        if ei is None:
+            coords=sf[:,:2]/1000; diff=coords.unsqueeze(1)-coords.unsqueeze(0)
+            cov=(1-v_fixed)*torch.exp(-c_fixed*torch.norm(diff,dim=-1))
+            cov.fill_diagonal_(0); A=torch.zeros_like(cov)
+            for i in range(n): A[i,torch.topk(cov[i],1)[1]]=cov[i,torch.topk(cov[i],1)[1]]
+            m=A>0; ei=m.nonzero().t(); ew=A[m]
+        x=x.reshape(b*n,x.size(2),L)
+        if self.ic: x=self.ic(x)
+        for conv, bn in zip(self.t_convs, self.bns): r=x; o=bn(conv(x)); x=F.dropout(F.relu(o+r),self.do,self.training)
+        x=x.mean(2).reshape(b*n,-1)
+        for conv, norm in zip(self.s_convs, self.norms): r=x; o=norm(conv(x,ei,ew)); x=F.dropout(F.relu(o+r),self.do,self.training)
+        out=self.fc(x.reshape(b,n,-1))
+        return out + (ks if ks is not None else 0)
+
+# load and prepare data
+_df=pd.read_excel('pm10.xlsx')
+df=_df.copy(); df['time']=pd.to_datetime(df['time'])
+df['node']=df['coords.x1'].astype(str)+'_'+df['coords.x2'].astype(str)
+for col in ['station_altitude','annual_mean_PM10']:
+    if col not in df: df[col]=np.random.rand(len(df))*50
+train=df.sample(frac=0.8,random_state=42); test=df.drop(train.index)
+# pivot and tensors
+tp=train.pivot('node','time','PM10').sort_index(axis=1)
+data=np.nan_to_num(tp.values, nan=np.nanmean(tp.values)).astype(np.float32)
+L=data.shape[1]; xs=[data[:,i:i+T_in][:,:,None] for i in range(L-T_in-horizon+1)]
+ys=[data[:,i+T_in:i+T_in+horizon] for i in range(L-T_in-horizon+1)]
+x_tr=torch.tensor(np.stack(xs),dtype=torch.float32);
+y_tr=torch.tensor(np.stack(ys),dtype=torch.float32)
+
+# compute kriging skip
+sf=torch.tensor(train.groupby('node')[['coords.x1','coords.x2']].first().values/1000, dtype=torch.float32)
+coords=sf.numpy(); t0=tp.columns.min(); times=np.array([(t-t0).total_seconds()/86400 for t in tp.columns])
+z=data[:,-1]
+ks=np.array([[[st_kriging(coords[n],times[i+T_in+j],coords,times,z,v_fixed,c_fixed,a_fixed,alpha_fixed,beta_fixed,m_total)
+         for j in range(horizon)] for n in range(data.shape[0])] for i in range(len(xs))],dtype=np.float32)
+ks_tr=torch.tensor(ks)
+
+# training loop
+model=GWN(input_dim,64,horizon,data.shape[0],4,3,dropout)
+opt=optim.Adam(model.parameters(),lr=1e-3); crit=nn.SmoothL1Loss()
+for e in range(epochs):
+    opt.zero_grad(); p=model(x_tr,sf,ks=ks_tr); loss=crit(p,y_tr); loss.backward(); opt.step()
+    if (e+1)%5==0: print(f"Epoch {e+1}, Loss:{loss.item():.4f}")
+
+# metrics
+def compute_metrics(p,t,eps=1e-8):
+    mse=np.mean((p-t)**2); rmse=np.sqrt(mse)
+    mae=np.mean(abs(p-t)); ne=np.abs(t[...,1:]-t[...,:-1]); scale=np.mean(ne) if ne.size else eps
+    mase=mae/(scale+eps); smape=np.mean(2*abs(p-t)/(abs(p)+abs(t)+eps))*100
+    ss_res=np.sum((t-p)**2); ss_tot=np.sum((t-np.mean(t))**2)+eps; r2=1-ss_res/ss_tot
+    return mse,rmse,mae,mase,smape,r2
+
+with torch.no_grad():
+    pr=model(x_tr,sf,ks=ks_tr).numpy(); true=y_tr.numpy()
+mse,rmse,mae,mase,smape,r2=compute_metrics(pr,true)
+print(f"Train MSE:{mse:.4f}, RMSE:{rmse:.4f}, MAE:{mae:.4f}, MASE:{mase:.4f}, sMAPE:{smape:.2f}%, R2:{r2:.4f}")
